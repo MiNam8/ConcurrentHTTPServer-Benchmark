@@ -1,0 +1,4 @@
+/home/miras/Desktop/SystemEngineering/HTTPServer/build/CMakeFiles/TCPServer.dir
+/home/miras/Desktop/SystemEngineering/HTTPServer/build/CMakeFiles/LoadGenerator.dir
+/home/miras/Desktop/SystemEngineering/HTTPServer/build/CMakeFiles/edit_cache.dir
+/home/miras/Desktop/SystemEngineering/HTTPServer/build/CMakeFiles/rebuild_cache.dir
