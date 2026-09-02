@@ -92,7 +92,6 @@ TCPServer_EXTERNAL_OBJECTS =
 
 TCPServer: CMakeFiles/TCPServer.dir/src/server.cpp.o
 TCPServer: CMakeFiles/TCPServer.dir/build.make
-TCPServer: /usr/lib/x86_64-linux-gnu/libboost_system.so.1.83.0
 TCPServer: CMakeFiles/TCPServer.dir/link.txt
 	@$(CMAKE_COMMAND) -E cmake_echo_color "--switch=$(COLOR)" --green --bold --progress-dir=/home/miras/Desktop/SystemEngineering/HTTPServer/build/CMakeFiles --progress-num=$(CMAKE_PROGRESS_2) "Linking CXX executable TCPServer"
 	$(CMAKE_COMMAND) -E cmake_link_script CMakeFiles/TCPServer.dir/link.txt --verbose=$(VERBOSE)
