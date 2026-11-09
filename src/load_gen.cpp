@@ -23,6 +23,9 @@ std::latch gate(1);
 int NUMBER_OF_THREADS = 50;
 int ITERATIONS = 100000 / NUMBER_OF_THREADS;
 bool KEEP_ALIVE = false;
+double TARGET_RATE = 0.0;  // --rate R: open-loop target (req/s, total); 0 = closed-loop
+std::atomic<long long> g_connect_err{0};   // connect()/socket() failures
+std::atomic<long long> g_io_err{0};        // write/read failures mid-request
 
 static int connect_to_server()
 {
@@ -94,7 +97,7 @@ static bool read_one_response(int fd, std::string& buf)
 void keep_alive_worker(std::vector<long long> &latencies)
 {
     int client = connect_to_server();
-    if (client < 0) { return; }
+    if (client < 0) { g_connect_err++; return; }
 
     gate.wait();   // fair start: all connections established, released together
 
@@ -107,12 +110,62 @@ void keep_alive_worker(std::vector<long long> &latencies)
     {
         auto start_time = std::chrono::steady_clock::now();
 
-        if (!write_all(client, request, request_len)) { close(client); return; }
-        if (!read_one_response(client, buf))          { close(client); return; }
+        if (!write_all(client, request, request_len)) { g_io_err++; close(client); return; }
+        if (!read_one_response(client, buf))          { g_io_err++; close(client); return; }
 
         auto end_time = std::chrono::steady_clock::now();
         latencies.push_back(
             std::chrono::duration_cast<std::chrono::microseconds>(end_time - start_time).count());
+    }
+    close(client);
+}
+
+// Open-loop worker: fixes coordinated omission. Each request has an *intended*
+// send time on a fixed schedule (start + i * interval); latency is measured from
+// that intended time, not from when the request actually went out. So when the
+// server saturates and a thread falls behind schedule, the requests it "should"
+// have sent are charged their full queuing delay -- the tail a closed-loop
+// generator hides, because there a slow server simply slows the send rate.
+// Uses a kept-alive connection so we measure service latency, not connect cost.
+void open_loop_worker(std::vector<long long> &latencies)
+{
+    int client = connect_to_server();
+    if (client < 0) { g_connect_err++; return; }
+
+    gate.wait();
+
+    const char* request = "GET / HTTP/1.1\r\nHost: localhost:8080\r\n\r\n";
+    size_t request_len = strlen(request);
+    std::string buf;
+
+    // Each thread carries 1/N of the total rate -> its own inter-request interval.
+    double interval = static_cast<double>(NUMBER_OF_THREADS) / TARGET_RATE;   // seconds
+    // Stagger thread phases so the N threads' requests are spread evenly across
+    // one interval instead of all firing together (which would be a synthetic
+    // thundering herd, inflating latency even below capacity). Thread k starts
+    // k/RATE seconds in, giving a smooth aggregate of one request every 1/RATE.
+    static std::atomic<int> s_idx{0};
+    int idx = s_idx.fetch_add(1);
+    double offset = static_cast<double>(idx) / TARGET_RATE;   // = idx * interval / N
+    auto start = std::chrono::steady_clock::now();
+
+    for (int i = 0; i < ITERATIONS; i++)
+    {
+        auto intended = start + std::chrono::duration_cast<std::chrono::steady_clock::duration>(
+                                    std::chrono::duration<double>(offset + interval * i));
+        if (std::chrono::steady_clock::now() < intended)
+        {
+            std::this_thread::sleep_until(intended);   // ahead of schedule: wait
+        }
+        // If we're behind (server slow), no sleep -- and latency below is measured
+        // from `intended`, so the accumulated backlog inflates the tail correctly.
+
+        if (!write_all(client, request, request_len)) { g_io_err++; close(client); return; }
+        if (!read_one_response(client, buf))          { g_io_err++; close(client); return; }
+
+        auto done = std::chrono::steady_clock::now();
+        latencies.push_back(
+            std::chrono::duration_cast<std::chrono::microseconds>(done - intended).count());
     }
     close(client);
 }
@@ -189,20 +242,20 @@ void do_one_request(std::vector<long long> &latencies)
 
 int main(int argc, char* argv[])
 {
-    if (argc != 5 && argc != 6)
+    if (argc < 5)
     {
-        std::cout << "Usage: ./LoadGenerator --concurrency 50 --requests 100000 [--keep-alive]";
+        std::cout << "Usage: ./LoadGenerator --concurrency 50 --requests 100000 [--keep-alive] [--rate R]\n";
         return 0;
     }
-    if (argc == 6)
+    for (int i = 5; i < argc; i++)
     {
-        std::string argv5 = argv[5];
-        if (argv5 != "--keep-alive")
+        std::string a = argv[i];
+        if (a == "--keep-alive") { KEEP_ALIVE = true; }
+        else if (a == "--rate" && i + 1 < argc)
         {
-            std::cout << "The 6th argument, if given, has to be --keep-alive";
-            return 0;
+            try { TARGET_RATE = std::stod(argv[++i]); }
+            catch (const std::exception& e) { std::cout << "Failed to parse --rate\n"; return 0; }
         }
-        KEEP_ALIVE = true;
     }
 
     std::string argv1 = argv[1];
@@ -244,7 +297,10 @@ int main(int argc, char* argv[])
     }
     std::vector<std::vector<long long> > results(NUMBER_OF_THREADS);
     std::vector<std::thread> vec;
-    auto worker = KEEP_ALIVE ? keep_alive_worker : do_one_request;
+    void (*worker)(std::vector<long long>&);
+    if (TARGET_RATE > 0)  { worker = open_loop_worker; }   // open-loop overrides keep-alive selection
+    else if (KEEP_ALIVE)  { worker = keep_alive_worker; }
+    else                  { worker = do_one_request; }
     for (int i = 0; i < NUMBER_OF_THREADS; i++)
     {
         vec.push_back(std::thread(worker, std::ref(results[i])));
@@ -283,8 +339,14 @@ int main(int argc, char* argv[])
     long long failed    = attempted - succeeded;
     double throughput   = succeeded / secs;   // secs from the wall-clock timer
 
+    const char* mode = (TARGET_RATE > 0) ? "open-loop" : (KEEP_ALIVE ? "closed-loop keep-alive" : "closed-loop churn");
+    std::printf("Mode:       %s", mode);
+    if (TARGET_RATE > 0) { std::printf(" (target %.0f req/s)", TARGET_RATE); }
+    std::printf("\n");
     std::printf("Requests:   %lld attempted, %lld ok, %lld failed\n",
             attempted, succeeded, failed);
+    std::printf("Errors:     %lld connect, %lld io\n",
+                g_connect_err.load(), g_io_err.load());
     std::printf("Throughput: %.0f req/s\n", throughput);
     std::printf("Latency (us): min %lld  p50 %lld  p95 %lld  p99 %lld  max %lld\n",
                 min, p50, p95, p99, max);

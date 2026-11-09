@@ -24,6 +24,7 @@
 #include <sys/sendfile.h>
 #include <sys/stat.h>
 #include <csignal>
+#include <chrono>
 #include <vector>
 #include <fd.hpp>
 
@@ -32,6 +33,7 @@ enum class ConnState{ Reading, Working, Writing };
 
 struct Connection {
     Fd fd;
+    uint64_t id = 0;             // unique per accept(); fd numbers get reused, ids never do
     std::string in;
     std::string out;
     size_t sent = 0;
@@ -39,7 +41,7 @@ struct Connection {
     bool keep_alive = true;
     off_t file_off = 0;          // Phase 5: sendfile() offset for this connection
     bool sending_file = false;   // Phase 5: mid-sendfile (body not yet fully sent)
-    // (Phase 7 will add: last_activity timestamp for idle timeouts)
+    std::chrono::steady_clock::time_point last_activity;   // Phase 7: for idle-timeout reaping
 };
 
 enum class ParseResult { NeedMore, Complete };
@@ -77,13 +79,22 @@ std::condition_variable cv;
 std::unordered_map <int, std::string> buffers;   // fd → bytes accumulated so far
 
 // --- hybrid arch: epoll I/O thread <-> CPU worker pool ---
+// Anything that outlives a connection (worker task, timer) carries fd + id, so a
+// result for a closed connection can't land on a new one that reused the fd.
+struct ConnRef
+{
+    int fd;
+    uint64_t id;
+};
+
 struct Completion
 {
     int fd;
+    uint64_t id;
     std::string response;
 };
 
-std::queue<int>          task_queue;
+std::queue<ConnRef>      task_queue;
 std::mutex               task_m;
 std::condition_variable  task_cv;
 
@@ -98,6 +109,10 @@ off_t       g_file_size = 0;
 bool        g_sendfile = false;    // true: sendfile(); false: read()+write()
 std::string g_file_headers;        // cached response headers (with Content-Length)
 std::string g_readwrite_body;      // whole file in userspace (read+write mode only)
+
+// --- Phase 7: hardening (both opt-in; 0 = disabled -> default benchmark behavior) ---
+int    g_idle_timeout_sec = 0;     // --idle-timeout: reap connections idle this long (Slowloris fix)
+size_t g_max_conns = 0;            // --max-conns: shed new connections beyond this cap (backpressure)
 
 void write_response(int client)
 {
@@ -198,11 +213,11 @@ void hybrid_worker()
 {
     while (true)
     {
-        int fd;
+        ConnRef task;
         {
             std::unique_lock<std::mutex> lock(task_m);
             task_cv.wait(lock, []{ return !task_queue.empty(); });
-            fd = task_queue.front();
+            task = task_queue.front();
             task_queue.pop();
         }   // <-- lock destructor unlocks task_m here, before the CPU work runs
 
@@ -224,7 +239,7 @@ void hybrid_worker()
 
         {
             std::lock_guard<std::mutex> lock(completion_m);
-            completion_queue.push({fd, resp});
+            completion_queue.push({task.fd, task.id, resp});
         }
 
         uint64_t one = 1;
@@ -403,7 +418,8 @@ static void run_epoll_loop(Fd listener, bool hybrid)
     }
 
     std::unordered_map<int, Connection> conns;      // client fd -> connection state
-    std::unordered_map<int, int> timer_to_client;   // per-loop: sleep-mode timers
+    std::unordered_map<int, ConnRef> timer_to_client;   // per-loop: sleep-mode timers
+    uint64_t next_conn_id = 0;                      // per-loop, only this thread touches it
     struct epoll_event events[64];
 
     // Close and forget a connection (Connection dtor -> Fd dtor -> close(fd)).
@@ -433,9 +449,14 @@ static void run_epoll_loop(Fd listener, bool hybrid)
         }
     };
 
+    // Phase 7: with idle timeouts on, wake at least every second to sweep for
+    // connections that have gone quiet (Slowloris). Otherwise block indefinitely.
+    int wait_ms = (g_idle_timeout_sec > 0) ? 1000 : -1;
+    auto last_sweep = std::chrono::steady_clock::now();
+
     while (true)
     {
-        int n = epoll_wait(ep, events, 64, -1);
+        int n = epoll_wait(ep, events, 64, wait_ms);
         for (int i = 0; i < n; i++)
         {
             int fd = events[i].data.fd;
@@ -447,12 +468,14 @@ static void run_epoll_loop(Fd listener, bool hybrid)
                 uint64_t exp;
                 ssize_t r = read(fd, &exp, sizeof(exp));   // drain the timerfd
                 (void)r;
-                int cfd = timer_to_client[fd];
+                ConnRef ref = timer_to_client[fd];
+                int cfd = ref.fd;
                 close(fd);
                 timer_to_client.erase(fd);
 
                 auto it = conns.find(cfd);
                 if (it == conns.end()) { continue; }       // client already gone
+                if (it->second.id != ref.id) { continue; } // fd reused by a new client: stale timer
                 Connection& c = it->second;
                 build_response(c);                          // sleep already "waited"
                 c.state = ConnState::Writing;
@@ -486,6 +509,9 @@ static void run_epoll_loop(Fd listener, bool hybrid)
 
                     auto it = conns.find(comp.fd);
                     if (it == conns.end()) { continue; }   // connection gone: drop the result
+                    // fd was closed and reused by a new accept() while the worker computed:
+                    // this result belongs to the old client, so drop it.
+                    if (it->second.id != comp.id) { continue; }
                     Connection& c = it->second;
 
                     c.out = comp.response;
@@ -507,6 +533,12 @@ static void run_epoll_loop(Fd listener, bool hybrid)
                 {
                     int cfd = accept(listener.get(), nullptr, nullptr);
                     if (cfd < 0) { break; }                 // EAGAIN: backlog drained
+                    // Phase 7: backpressure -- shed the connection if at the cap.
+                    if (g_max_conns > 0 && conns.size() >= g_max_conns)
+                    {
+                        close(cfd);
+                        continue;
+                    }
                     set_nonblocking(cfd);
                     set_nodelay(cfd);
                     struct epoll_event cev{};
@@ -515,6 +547,8 @@ static void run_epoll_loop(Fd listener, bool hybrid)
                     epoll_ctl(ep, EPOLL_CTL_ADD, cfd, &cev);
                     auto it = conns.try_emplace(cfd).first; // default Connection
                     it->second.fd = Fd{cfd};                // take ownership of cfd
+                    it->second.id = ++next_conn_id;
+                    it->second.last_activity = std::chrono::steady_clock::now();
                 }
                 continue;
             }
@@ -523,6 +557,7 @@ static void run_epoll_loop(Fd listener, bool hybrid)
             auto it = conns.find(fd);
             if (it == conns.end()) { continue; }
             Connection& c = it->second;
+            c.last_activity = std::chrono::steady_clock::now();   // Phase 7: mark active
 
             if (evmask & (EPOLLHUP | EPOLLERR))
             {
@@ -556,7 +591,7 @@ static void run_epoll_loop(Fd listener, bool hybrid)
                         // Defer 100 ms without blocking the loop: arm a timerfd.
                         c.state = ConnState::Working;
                         int tfd = timerfd_create(CLOCK_MONOTONIC, 0);
-                        timer_to_client[tfd] = fd;
+                        timer_to_client[tfd] = {fd, c.id};
                         struct epoll_event tev{};
                         tev.data.fd = tfd;
                         tev.events = EPOLLIN;
@@ -575,7 +610,7 @@ static void run_epoll_loop(Fd listener, bool hybrid)
                         mod_events(fd, 0);                  // park the fd: no epoll interest until the response is ready
                         {
                             std::lock_guard<std::mutex> lock(task_m);
-                            task_queue.push(fd);
+                            task_queue.push({fd, c.id});
                         }
                         task_cv.notify_one();
                         break;                              // this connection is now in a worker's hands
@@ -602,6 +637,29 @@ static void run_epoll_loop(Fd listener, bool hybrid)
                 else if (fr == FlushResult::Error) { close_conn(fd); }
                 // WouldBlock: stay on EPOLLOUT, wait for the next event.
                 continue;
+            }
+        }
+
+        // Phase 7: reap connections idle beyond the timeout. Only those still
+        // Reading (awaiting a request) are candidates -- a Slowloris client that
+        // opened a socket and then sends its request bytes too slowly, or never.
+        // Connections mid-work (Working/Writing) are never reaped out from under us.
+        if (g_idle_timeout_sec > 0)
+        {
+            auto now = std::chrono::steady_clock::now();
+            if (now - last_sweep >= std::chrono::seconds(1))
+            {
+                last_sweep = now;
+                auto deadline = std::chrono::seconds(g_idle_timeout_sec);
+                std::vector<int> idle;
+                for (auto& [cfd, conn] : conns)
+                {
+                    if (conn.state == ConnState::Reading && now - conn.last_activity > deadline)
+                    {
+                        idle.push_back(cfd);
+                    }
+                }
+                for (int cfd : idle) { close_conn(cfd); }   // erases from conns
             }
         }
     }
@@ -691,6 +749,8 @@ int main(int argc, char* argv[])
         if (a == "--file" && i + 1 < argc) { file_path = argv[++i]; }
         else if (a == "--io=sendfile")     { g_sendfile = true; }
         else if (a == "--io=readwrite")    { g_sendfile = false; }
+        else if (a == "--idle-timeout" && i + 1 < argc) { g_idle_timeout_sec = std::stoi(argv[++i]); }
+        else if (a == "--max-conns" && i + 1 < argc)    { g_max_conns = static_cast<size_t>(std::stoul(argv[++i])); }
     }
     if (!file_path.empty())
     {

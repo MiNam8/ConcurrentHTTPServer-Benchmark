@@ -11,7 +11,7 @@ import pandas as pd
 import matplotlib.pyplot as plt
 
 CSV = "../results.csv"
-ARCH_ORDER = ["thread-per-conn", "pool", "epoll"]
+ARCH_ORDER = ["thread-per-conn", "pool", "epoll", "hybrid", "epoll-mt"]
 
 df = pd.read_csv(CSV)
 

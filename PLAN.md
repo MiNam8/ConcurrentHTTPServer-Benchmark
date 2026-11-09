@@ -48,9 +48,16 @@ they are the "before" in the story; new architectures are added alongside, never
   - `--file <path> --io=<readwrite|sendfile>`; sendfile streams from a shared read-only fd with per-connection offset, resumed through the EPOLLOUT path (non-blocking). Correctness: readwrite/sendfile/original md5 identical at 1 MB (proves the resume reassembles a >socket-buffer response). `bench/run_sendfile.sh` + `analysis/plot_sendfile.py`.
   - **Result (single epoll, MB/s):** 1K rw 83 / sf 51 (sendfile's 2 syscalls lose on tiny files); 100K ~2000 vs 2600 (crossover); 1M 1426 vs **4464**; 10M 880 vs **3010** (~3.4×). readwrite drops past cache size (memory-bandwidth bound on the userspace copy); sendfile stays flat.
   - **Nagle/delayed-ACK war story:** the 2-syscall send (write headers + sendfile body) stalled ~40 ms/req on small files (p50 41 ms) until `TCP_NODELAY` was set on accepted sockets — 1K sendfile 1,219 → 52,606 req/s. `set_nodelay()` now applied to all accepted connections (all archs).
-- [ ] **Phase 6 — Serious benchmark harness (open-loop, keep-alive, `wrk` validation)**
-- [ ] **Phase 7 — Production hardening (graceful shutdown, timeouts, backpressure, RAII sweep)**
-- [ ] **Phase 8 — Write-up (README restructure + performance curves)**
+- [x] **Phase 6 — Serious benchmark harness (open-loop, keep-alive, `wrk` validation)** *(core DONE)*
+  - `--rate R` open-loop mode fixes coordinated omission: latency measured from each request's *intended* schedule (start + i/rate), threads phase-staggered (idx/RATE) to avoid a synthetic thundering herd. Error breakdown (connect/io) + Mode line added.
+  - **Result (epoll cpu, ~360 req/s ceiling, c=50):** closed-loop p99 **273 ms** vs open-loop@500 p99 **3.8 s** at the *same* actual throughput (~345) — coordinated omission = 14× hidden tail. Sanity: open-loop@100 (under capacity) p99 **7.5 ms** (no false inflation).
+  - TODO (optional): `wrk` cross-check for closed-loop agreement.
+- [x] **Phase 7 — Production hardening (timeouts, backpressure)** *(DONE, w/ documented shutdown gap)*
+  - **Idle timeouts** (`--idle-timeout <sec>`): finite `epoll_wait` + per-loop 1 s sweep reaps connections still in `Reading` past the deadline. Fixes Slowloris — verified: partial-request connection closed after exactly 3.0 s (EOF); active connections never reaped (Working/Writing excluded).
+  - **Backpressure** (`--max-conns <N>`): shed (close) new connections beyond the cap — verified 5 of 10 served at cap=5. Both opt-in (0 = disabled); default benchmark behavior byte-identical (regression 5000/0).
+  - **Graceful shutdown — documented limitation:** SIGTERM handler exits cleanly (emits RUSAGE, kernel reclaims all fds -> no leaks), but full in-flight *drain* is not implemented (high-cost across the multi-loop epoll-mt for a benchmark). Honest gap.
+- [x] **Phase 8 — Write-up (README restructure + performance curves)** *(DONE)*
+  - README fully restructured around the theme + four groups as an engineering narrative (baseline → bottleneck → synthesis → quantify). Embeds cores/threads/ctxsw + sendfile graphs; headline table; keep-alive, sendfile+Nagle, coordinated-omission, and hardening results. `run.sh` ARCHS + `plot.py` ARCH_ORDER extended to all 5 archs (re-run `./run.sh` to refresh the baseline throughput/latency graphs with hybrid + epoll-mt lines).
 
 ---
 
@@ -87,6 +94,12 @@ Separate network I/O from CPU-bound work to fix single-threaded epoll's one-core
   in epoll; the epoll thread drains completions and writes responses via the Phase-1 `EPOLLOUT` path.
 - New `--arch=hybrid`. Correctness: connection ids (not raw pointers) across threads; epoll thread
   never blocks on queues; drain the whole completion queue per `eventfd` wake.
+- **KNOWN BUG — fd reuse (open):** the task/completion queues carry the raw fd, not a connection id.
+  If a client disconnects mid-compute, its fd is closed and the kernel hands the same number to the
+  next `accept()`. The completion handler (`conns.find(comp.fd)` in `run_epoll_loop`) then finds the
+  *new* connection and writes the old response to the wrong client. Fix: add a per-connection
+  generation id (counter bumped on every accept), carry `{fd, id}` through both queues, and drop the
+  completion if `conns[fd].id != comp.id`.
 
 ## Phase 3 — Multi-threaded epoll + `SO_REUSEPORT`
 

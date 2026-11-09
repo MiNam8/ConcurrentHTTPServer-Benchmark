@@ -3,7 +3,7 @@ set -uo pipefail
 
 ulimit -n 4096
 
-ARCHS=("thread-per-conn" "pool" "epoll")
+ARCHS=("thread-per-conn" "pool" "epoll" "hybrid" "epoll-mt")
 BUILDS=("none" "cpu" "sleep")
 CONCURRENCIES=(1 10 50 100 200 500)
 WORKERS=16

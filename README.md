@@ -1,231 +1,230 @@
-# Server Concurrency Benchmark: thread-per-connection vs. thread pool vs. epoll
+# Designing and Optimizing a Linux HTTP Server
 
-A from-scratch C++ study of three server concurrency models under load, measuring
-latency (p50/p95/p99) and throughput across three workload types. The point of the
-project is not the server — it is the **measurement and the explanation of *why* each
-architecture wins or loses in each regime.**
+A from-scratch C++ study in **performance engineering of a Linux HTTP server across I/O, CPU
+scheduling, and concurrency.** It follows one engineering loop end to end:
 
-**Headline result: there is no single best architecture.** The right choice is dictated by
-the *nature of the work* — CPU-bound, I/O-bound, or connection-handling — and different
-regimes produce *opposite* winners. The unifying principle: **single-threaded epoll trades
-multi-core throughput for near-zero per-connection cost**, so it wins only when connections
-are mostly idle, while a core-sized thread pool wins whenever there is real work to spread
-across cores.
+> **baseline → benchmark → find the bottleneck → re-architect → benchmark → quantify.**
+
+The project starts by comparing three classic concurrency models, uses in-process and OS-level
+instrumentation to *prove why* each one wins or loses, then **engineers past the bottleneck it
+measures** with two synthesis architectures — and closes with systems optimizations
+(HTTP keep-alive, zero-copy `sendfile`), a coordinated-omission-aware benchmark harness, and
+production hardening. The point is not the server; it is the **measurement and the mechanism.**
 
 ---
 
-## TL;DR
+## The headline
 
-| Workload | Best | Worst | Why |
+Single-threaded `epoll` is measured to **collapse to one core (358 req/s)** under CPU-bound load
+while the machine has 16. Two different re-architectures recover the cores:
+
+| architecture | strategy | CPU-bound throughput | cores used |
 |---|---|---|---|
-| **CPU-bound** | thread pool (~4.4k req/s) | **epoll (360 req/s)** | CPU work needs many cores; epoll's single thread uses one |
-| **I/O-bound** | epoll & thread-per-conn (~4.4k req/s) | **thread pool (159 req/s)** | waiting is cheap; the pool's fixed workers cap concurrent waits |
-| **10k-connection churn** | thread pool (~77k req/s) | **thread-per-conn (706 timeouts)** | per-connection syscalls need cores; epoll is single-core-bound; thread-per-conn drowns in thread churn |
+| single `epoll` (baseline) | one thread, one loop | **358 req/s** | **1.0 / 16** |
+| **hybrid** (epoll + worker pool + eventfd) | offload *CPU work* to a pool | **4,234 req/s** (11.8×) | ~13 |
+| **epoll-mt** (`SO_REUSEPORT`) | N loops, kernel spreads *connections* | **3,487 req/s** (9.8×) | ~11 |
+| thread pool (reference) | 16 blocking workers | 4,469 req/s | ~14 |
 
-The **same design property flips from asset to liability** with the workload: the pool's
-fixed workers win for CPU and connection-handling work, but cap concurrency for I/O waits;
-epoll's single thread is near-free per connection but limited to one core for real work.
+The two synthesis architectures are *two different answers to the same bottleneck*, and they have
+**different failure modes** (below) — which is the interesting part.
 
----
+![core saturation](analysis/cores_cpu.png)
 
-## The three architectures
-
-All three share one request handler (`respond`); they differ only in **how concurrency is
-achieved**.
-
-1. **thread-per-connection** — the accept loop spawns a new detached `std::thread` per
-   connection. Simple; concurrency = connection count (unbounded).
-2. **thread pool** — a fixed set of `N` worker threads (`--workers`) pull connection fds
-   from a shared `std::queue` guarded by a `std::mutex` + `std::condition_variable`.
-   Concurrency is capped at `N`; excess connections wait in the queue.
-3. **epoll event loop** — a single thread with non-blocking sockets and `epoll_wait`.
-   Partial reads are reassembled per-connection (`fd → buffer` map) until the `\r\n\r\n`
-   header terminator arrives. I/O-bound work is simulated **without blocking the thread**
-   via `timerfd`: instead of sleeping, the handler arms a timer, registers it with epoll,
-   and sends the response when the timer fires (see *Design notes*).
-
-## Methodology
-
-- **Load generator** (`src/load_gen.cpp`): N worker threads released simultaneously by a
-  `std::latch` (fair start), each looping requests over a fresh connection per request
-  (`connect → send → recv → close`). Per-thread latency vectors are merged, sorted, and
-  reduced to p50/p95/p99/min/max + throughput after all threads join.
-- **Work modes** (`--build`): `none` (write response immediately), `cpu` (~3 ms of
-  irreducible xorshift compute per request — a stand-in for CPU-bound work), `sleep`
-  (100 ms wait per request — a stand-in for I/O-bound work).
-- **Sweep** (`run.sh`): every `architecture × work-mode × concurrency` combination; the
-  server is started, probed for readiness, driven, and killed per run; results appended to
-  `results.csv`. Concurrency ∈ {1, 10, 50, 100, 200, 500}; 3000 requests/run.
-- **Scale test** (`wrk`): the custom generator is itself thread-per-connection, so it can't
-  cleanly drive 10k connections (its own threads would saturate the machine). The C10k
-  sweep therefore uses `wrk` (an epoll-based load tool) at 1k / 5k / 10k connections.
-- **Hardware**: Intel Core i7-13620H (10 cores / **16 logical threads**), Linux.
-- **Analysis** (`analysis/plot.py`): pandas + matplotlib; `uv run plot.py`.
+*Every architecture except single-epoll (green, pinned flat on the 1-core line) climbs toward the
+core count. This one graph is the thesis of the project.*
 
 ---
 
-## Results
+## The four groups
 
-### 1. CPU-bound (`--build=cpu`)
+1. **Baseline architectures** — thread-per-connection, thread pool, single-threaded epoll
+2. **Synthesis architectures** — hybrid (epoll + worker pool + `eventfd`); multi-threaded epoll + `SO_REUSEPORT`
+3. **Systems optimizations** — HTTP keep-alive; `sendfile()` vs `read()`+`write()`
+4. **Instrumentation** — throughput, p50/p95/p99, core utilization, context switches, thread counts
 
-![throughput](analysis/throughput_cpu.png)
-![latency](analysis/latency_cpu.png)
+All architectures share one request handler and one non-blocking HTTP/1.1 state machine; they differ
+only in **how concurrency and CPU work are scheduled.** Workloads are selectable: `none` (echo),
+`cpu` (~3 ms of irreducible xorshift compute — stands in for CPU-bound work), `sleep` (100 ms wait —
+stands in for I/O-bound work).
 
-At concurrency 500:
+---
 
-| arch | throughput | p99 latency |
+## Group 1 — Baseline architectures, and the bottleneck
+
+Three models, one handler:
+
+1. **thread-per-connection** — a detached `std::thread` per connection. Concurrency = connection count (unbounded).
+2. **thread pool** — `N` workers pull connections from a `mutex`+`condvar` queue. Concurrency capped at `N`.
+3. **single-threaded epoll** — one thread, non-blocking sockets, a full read/write state machine (partial reads reassembled to `\r\n\r\n`, `EPOLLOUT` for partial writes, `timerfd` to simulate I/O waits without blocking the loop).
+
+The comparison already shows **there is no single best architecture** — the winner flips with the
+nature of the work:
+
+| workload | best | worst | why |
+|---|---|---|---|
+| **CPU-bound** | thread pool (~4.4k req/s) | **epoll (358 req/s)** | CPU needs many cores; epoll's one thread uses one |
+| **I/O-bound** | epoll & thread-per-conn (~4.4k) | **thread pool (159 req/s)** | waiting is cheap; the pool's 16 workers cap concurrent waits |
+| **C10k churn** | thread pool (~77k) | **thread-per-conn (706 timeouts)** | per-connection syscalls need cores; thread-per-conn drowns in thread churn |
+
+**The bottleneck this exposes:** single-threaded epoll trades multi-core throughput for near-zero
+per-connection cost. It wins when connections idle, but a single core is a hard ceiling when they are
+busy. The rest of the project is about **engineering past that ceiling** — and instrumenting *why* it
+exists.
+
+![cpu throughput](analysis/throughput_cpu.png) ![cpu latency](analysis/latency_cpu.png)
+
+---
+
+## Group 2 — Synthesis architectures (engineering past the ceiling)
+
+### Hybrid: epoll I/O thread + CPU worker pool + `eventfd`
+
+One epoll thread owns all sockets and the state machine. When a request needs CPU work, the epoll
+thread packages a job (connection id) onto a task queue and **returns immediately to serving I/O**;
+a worker computes the response, pushes it to a completion queue, and wakes the epoll thread by writing
+to an **`eventfd` registered in epoll**. The epoll thread drains completions and writes them out
+through the same `EPOLLOUT` path.
+
+- Cross-thread safety uses **fd-as-id** (look-up-or-drop), never a raw pointer into the connection map.
+- The offloaded fd is **parked** (`EPOLL_CTL_MOD` to 0 interest) so it can't busy-spin while a worker runs.
+- Result: **358 → 4,234 req/s (11.8×)**, ≈95% of the thread pool, p99 46 ms vs epoll's 290 ms — *without* the pool's keep-alive weakness (below). A worker holds a job for a few ms, never a whole connection.
+
+### epoll-mt: N independent loops + `SO_REUSEPORT`
+
+`N` threads, each with its **own** listening socket bound with `SO_REUSEPORT` and its own epoll loop.
+The kernel load-balances connections across the listeners (how nginx scales). No shared connection
+state → **no hot-path locking.** Result: **357 req/s at 1 loop (identical to single-epoll) → 3,487 at
+16 (9.8×).**
+
+**The interesting difference — two strategies, two failure modes.** The pool/hybrid pull from a
+*shared queue* (balanced per **request**); `SO_REUSEPORT` assigns a whole **connection** to a loop up
+front. So under uneven per-connection cost, some loops overload while others idle → epoll-mt tops out
+at ~11 cores (not ~14) and its p99 is far worse (221 ms vs hybrid's 62 ms at c=200). Same goal,
+genuinely different tradeoff — a comparison most projects never reach.
+
+---
+
+## Group 3 — Systems optimizations
+
+### HTTP keep-alive
+
+The epoll server became a real event-driven HTTP/1.1 server: per-connection state, a pragmatic
+parser, keep-alive, and correct draining of **pipelined requests batched in one `recv`** (a subtle
+level-triggered-epoll bug: once bytes are read out of the kernel buffer no further `EPOLLIN` fires, so
+all buffered requests must be parsed in a loop). Keep-alive removes a TCP handshake per request:
+**+50% throughput on epoll** (65k → 98k req/s), and up to **8–11×** on the blocking archs.
+
+This surfaced a real finding: **keep-alive breaks the thread pool's concurrency model.** A pool worker
+sits in one connection for its whole lifetime, so effective concurrency collapses to `--workers` and
+connections beyond that starve (p50 21 µs but p99 6.8 ms). The hybrid has no such failure — connections
+live on the epoll thread, not on workers.
+
+### `sendfile()` vs `read()`+`write()`
+
+Static files served two ways: bytes copied through userspace (`read+write`) vs zero-copy kernel→socket
+(`sendfile`), with the non-blocking `EPOLLOUT` resume tracking a per-connection file offset. Verified
+byte-identical (md5) including a 1 MB response that exceeds the socket buffer.
+
+![sendfile](analysis/sendfile_mbps.png)
+
+| file size | read+write | sendfile |
 |---|---|---|
-| thread pool | **4,405 req/s** | 129 ms |
-| thread-per-conn | 4,188 req/s | 133 ms |
-| **epoll** | **360 req/s** | **1,386 ms** |
+| 1 KB | **83 MB/s** | 51 MB/s |
+| 100 KB | 2001 MB/s | **2614 MB/s** |
+| 1 MB | 1426 MB/s | **4464 MB/s** |
+| 10 MB | 880 MB/s | **3010 MB/s** (~3.4×) |
 
-**Mechanism.** CPU-bound work needs cores. The pool (16 workers) and thread-per-conn both
-spread work across all 16 logical cores and plateau near ~4.4k req/s — the machine's
-compute ceiling for ~3 ms requests. **epoll collapses to one core**: its single thread can
-only run one xorshift loop at a time, so throughput is flat at ~360 req/s (≈ 1 core ÷ 3 ms)
-regardless of concurrency, and its p99 explodes to **1.4 seconds** as work backs up behind
-the one thread. A single-threaded event loop cannot parallelize computation.
+Below ~100 KB the extra syscall makes `sendfile` a slight loss; above it, zero-copy wins big —
+`read+write` goes memory-bandwidth-bound once the file outgrows cache, while `sendfile` stays flat.
 
-### 2. I/O-bound (`--build=sleep`)
+**Bonus war story:** sending headers and body in two syscalls stalled small-file `sendfile` **~40 ms
+per request** — the classic **Nagle's-algorithm / delayed-ACK** interaction. Setting **`TCP_NODELAY`**
+on accepted sockets took 1 KB `sendfile` from 1,219 → **52,606 req/s.**
 
-![throughput](analysis/throughput_sleep.png)
-![latency](analysis/latency_sleep.png)
+---
 
-At concurrency 500:
+## Group 4 — Instrumentation (proving *why*)
 
-| arch | throughput | p99 latency |
+A `/proc` CPU sampler (`bench/cpu_sampler.py`) plus in-server `getrusage(RUSAGE_SELF)` on `SIGTERM`
+(which aggregates *exited* threads — essential for thread-per-conn's churn) turn every result from a
+claim into a mechanism.
+
+![thread counts](analysis/threads_cpu.png) ![context switches](analysis/ctxsw_cpu.png)
+
+- **Core saturation** (top graph): epoll pinned at **1.0 core** — its 358 req/s ceiling, made visible.
+- **Thread counts:** thread-per-conn explodes to 160+ threads with concurrency; the epoll family stays flat (1 loop, or a fixed pool).
+- **Context switches:** epoll pays **near-zero** involuntary switches (one thread is never preempted for a peer). thread-per-conn's signature is its **floor** — ~1 involuntary switch *per request* even at concurrency 1, a fixed thread-churn tax the persistent-worker archs don't pay.
+
+### Benchmark methodology — fixing coordinated omission
+
+The load generator adds an **open-loop mode** (`--rate R`): each request has an *intended* send time,
+and latency is measured against that schedule (threads phase-staggered to avoid a synthetic thundering
+herd). So when the server saturates, requests that *should* have been sent are charged their queuing
+delay — the tail a closed-loop generator structurally hides.
+
+| driving epoll (cpu, ~360 req/s ceiling), c=50 | actual throughput | p99 |
 |---|---|---|
-| thread-per-conn | **4,448 req/s** | 144 ms |
-| epoll | **4,265 req/s** | 111 ms |
-| **thread pool** | **159 req/s** | **3,110 ms** |
+| closed-loop | 343 req/s | **273 ms** *(the comfortable lie)* |
+| open-loop @ 500 (overload) | 345 req/s | **3.8 s** *(the tail a user actually sees)* |
+| open-loop @ 100 (healthy) | 100 req/s | **7.5 ms** *(no false inflation)* |
 
-**The inversion.** A waiting request costs almost nothing, so what matters is *how many
-requests can wait at once*. thread-per-conn holds 500 parked threads in parallel; epoll
-holds 500 kernel timers on **one** thread — both sustain ~4.4k req/s. The **thread pool is
-capped at its 16 workers**: a worker is *fixated* on its request through the entire 100 ms
-wait, so only 16 requests are ever in flight (16 ÷ 0.1 s = **160 req/s**, exactly the
-measured 159). Excess connections queue, and p99 balloons to **3.1 seconds**. The pool's
-bounded concurrency — its CPU-mode strength — is now a hard ceiling.
-
-*epoll matching thread-per-conn here, on a single thread, validates the `timerfd` design.*
-
-### 3. Negligible work (`--build=none`)
-
-![throughput](analysis/throughput_none.png)
-
-Baseline with no per-request work. The pool leads (~63k req/s at concurrency 500) because
-bounded concurrency avoids the scheduling/oversubscription overhead that thread-per-conn
-(500 threads) and epoll incur; latency climbs for all three as pure connection overhead
-accumulates.
-
-### 4. C10k connection scale (`wrk`, no per-request work)
-
-Driven by `wrk` at 10,000 concurrent connections (connection-per-request, so this stresses
-connection *churn* — accept/read/write/close — rather than idle persistence):
-
-| arch | throughput | p99 latency | timeouts |
-|---|---|---|---|
-| **thread pool** | **76,624 req/s** | **164 ms** | **0** |
-| epoll | 33,804 req/s | 385 ms | 0 |
-| thread-per-conn | 20,401 req/s | 618 ms | **706** |
-
-**Mechanism.** Handling a connection (`accept`/`read`/`write`/`close`) is real per-connection
-CPU/syscall work, so it needs cores. The **pool spreads it across all 16 cores** with no
-thread churn → 3.75× the throughput of thread-per-conn, lowest tail, zero timeouts.
-**epoll is single-*core*-bound**: one thread does every syscall for all 10k connections, so
-it tops out at ~34k req/s (one core's syscall ceiling) — clean (0 timeouts) but half the
-pool's throughput. **thread-per-conn** creates a thread *per connection* (~20k thread
-creates/sec), saturating the scheduler until connections start **timing out (706)**.
-
-This is the key nuance: **single-threaded epoll trades multi-core throughput for near-zero
-per-connection cost.** It excels when connections are *idle* (the I/O-bound result above),
-but a single core is a ceiling when they are *busy*. Production servers (e.g. nginx) run
-**one epoll loop per core** (`SO_REUSEPORT`) to get both — the natural next step here.
-
-*Caveat: because the server closes each connection, this measures 10k churning connections,
-not 10k idle-persistent ones. The canonical "hold 10k idle connections on one thread" result
-would require HTTP keep-alive (see limitations).*
+Same server, same throughput, a **14× hidden tail** — coordinated omission, quantified.
 
 ---
 
-## The thesis
+## Production hardening
 
-Across four experiments, one principle explains every result:
+- **Idle-connection timeouts** (`--idle-timeout`): a periodic sweep reaps connections still awaiting a
+  request past the deadline — **fixes the Slowloris weakness** (verified: a partial-request connection
+  is closed after exactly the configured timeout; active connections are never reaped).
+- **Backpressure** (`--max-conns`): shed new connections beyond a cap instead of unbounded growth
+  (verified 5-of-10 served at cap 5).
+- **RAII throughout:** every fd owned by a move-only `Fd` wrapper (`include/fd.hpp`), closed in its destructor.
+- **Honest gap:** `SIGTERM` exits cleanly (stats emitted, kernel reclaims all fds — no leaks), but full
+  in-flight *drain* across the multi-loop epoll-mt is not implemented.
 
-| regime | the work is... | winner | why |
-|---|---|---|---|
-| CPU-bound | per-request compute | **pool** | needs all cores; epoll stuck on 1 |
-| I/O-bound | per-request waiting | **epoll / thread-per-conn** | cheap concurrent waits; pool's 16 workers bottleneck |
-| C10k churn | per-connection syscalls | **pool** | multi-core handling; epoll 1-core-bound; thread-per-conn thread-churn |
-
-- **Bounded concurrency (thread pool):** matching workers to cores *wins* whenever there is
-  real work to parallelize (CPU, connection handling), but *caps* concurrency when the work
-  is cheap waiting → 28× lower throughput and seconds-long tails under I/O load.
-- **A blocking thread per request (thread-per-conn):** fine when the work is *waiting*
-  (parked threads are cheap), degrades when it *computes* or *churns* (threads thrash / the
-  scheduler saturates and connections time out).
-- **A single non-blocking thread (epoll):** **near-free per connection** (its superpower for
-  many idle connections), but **limited to one core** for any real per-request or
-  per-connection work.
-
-**The unifying insight: single-threaded epoll trades multi-core throughput for near-zero
-per-connection cost.** It wins only when the workload is dominated by *idle waiting*; the
-pool wins whenever there is work to spread across cores. There is no universal best —
-choosing one architecture for all workloads is choosing to lose in some regime.
+Both hardening features are **opt-in** — with no flags, the default benchmark behavior is byte-identical.
 
 ---
-
-## Known limitations
-
-Honest boundaries of this study, all of which are areas the design deliberately does not
-cover:
-
-- **Single-threaded epoll.** The epoll server uses one thread, so it is capped at one core
-  for real work (visible in the CPU and C10k results). A production design runs one epoll
-  loop per core (`SO_REUSEPORT`) to combine epoll's low per-connection cost with multi-core
-  throughput — the clear next step.
-- **Churn, not persistence, at C10k.** The server closes each connection, so the 10k test
-  measures connection *churn*, not 10k *idle-persistent* connections. epoll's most dramatic
-  advantage — holding thousands of idle connections on one thread while thread-per-conn's
-  thousands of threads exhaust memory — requires HTTP keep-alive, which is not implemented.
-- **epoll write side is synchronous.** The response write is not deferred via `EPOLLOUT`;
-  it relies on the ~70-byte response always fitting the socket buffer (true on loopback,
-  not on real networks with slow clients). A production epoll server would need a write-side
-  state machine.
-- **No timeouts.** A slow or stalled client holds resources indefinitely (a Slowloris-style
-  weakness). Not relevant to a controlled benchmark; essential for a real server.
-- **Tail-latency confidence.** `sleep` runs use 3000 requests, so p99 (and especially
-  low-concurrency points) is noisier than the CPU/none runs would support. Percentile
-  confidence scales with sample count.
-- **Loopback only.** No real network effects (RTT, loss, congestion).
 
 ## Design notes
 
-- **`usleep` vs `timerfd`.** The threaded architectures simulate I/O with a blocking
-  `usleep` (each has its own thread to block). epoll cannot — one `usleep` would freeze the
-  whole event loop — so it uses `timerfd`: a timer exposed as an fd that epoll watches, so
-  the single thread starts the wait and moves on. Same 100 ms service time, two mechanisms,
-  because the contexts differ.
-- **CPU work is irreducible.** The xorshift loop carries a data dependency across
-  iterations so `-O2` cannot delete or collapse it; the result is stored to a `volatile`
-  sink.
+- **CPU work is irreducible** — a data-dependent xorshift chain stored to a `volatile` sink, so `-O2` can't elide it.
+- **`timerfd` for epoll's I/O wait** — the blocking archs `usleep`; epoll can't (it would freeze the loop), so it arms a timer exposed as an fd and moves on.
+- **`eventfd` doorbell** — the only way a worker thread can wake a thread blocked in `epoll_wait`: it's a counter behind an fd that epoll watches. Coalesced wakeups mean the whole completion queue is drained per wake.
+
+## Known limitations
+
+- **Churn, not idle persistence, at C10k** — the original C10k test closes each connection; the canonical "hold 10k *idle* connections on one thread" result now that keep-alive exists is future work.
+- **Loopback only** — no real RTT/loss/congestion.
+- **`SIGTERM` drain** — clean exit, but not a graceful in-flight drain (see hardening).
+- **Tail confidence** — `sleep` runs use 3000 requests; low-concurrency p99 is noisier.
 
 ## Reproduce
 
 ```bash
-# build + run the full sweep -> results.csv
-./run.sh
+cmake -S . -B build -DCMAKE_BUILD_TYPE=Release && cmake --build build
 
-# generate graphs -> analysis/*.png
+# full architecture sweep -> results.csv, then baseline graphs
+./run.sh
 cd analysis && uv run plot.py
+
+# instrumentation (cores / threads / context switches)
+bash bench/run_instrumented.sh && (cd analysis && uv run plot_instrumentation.py)
+
+# sendfile size sweep
+bash bench/run_sendfile.sh && (cd analysis && uv run plot_sendfile.py)
 ```
 
-Run a single configuration manually:
+Run one configuration manually:
 
 ```bash
-# terminal 1 (server): --build=<none|cpu|sleep> --arch=<thread-per-conn|pool|epoll>
-build/TCPServer --build=cpu --arch=pool --workers 16
+# server: --build=<none|cpu|sleep> --arch=<thread-per-conn|pool|epoll|hybrid|epoll-mt> --workers N
+#         [--file <path> --io=<readwrite|sendfile>] [--idle-timeout S] [--max-conns N]
+build/TCPServer --build=cpu --arch=hybrid --workers 16
 
-# terminal 2 (load): --concurrency N --requests M
-build/LoadGenerator --concurrency 200 --requests 20000
+# load: [--keep-alive] [--rate R]  (--rate R = open-loop, coordinated-omission-aware)
+build/LoadGenerator --concurrency 200 --requests 20000 --keep-alive
 ```
+
+**Hardware:** Intel Core i7-13620H (10 cores / 16 threads), Linux. **Analysis:** pandas + matplotlib via `uv`.
